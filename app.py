@@ -24,6 +24,12 @@ REQUEST_TIMEOUT = 15  # seconds per attempt
 MAX_ATTEMPTS = 3      # total tries before giving up
 RETRY_DELAY = 2       # seconds to wait between attempts
 
+# Short server-side cache: repeat searches for the same city are served
+# instantly without touching the upstream APIs (which rate-limit us).
+# A plain dict is enough on single-worker free hosting.
+CACHE_TTL = 600  # seconds
+_weather_cache = {}
+
 # A descriptive User-Agent: some networks/WAFs treat the default
 # python-requests UA worse than an identified client.
 HEADERS = {"User-Agent": "WeatherNow/1.0 (educational project)"}
@@ -281,6 +287,23 @@ def fetch_metno(latitude, longitude):
     }
 
 
+def cache_get(city):
+    """Return the cached payload for `city`, or None if missing/expired."""
+    key = city.lower()
+    entry = _weather_cache.get(key)
+    if entry and entry[0] > time.time():
+        return entry[1]
+    _weather_cache.pop(key, None)
+    return None
+
+
+def cache_put(city, payload):
+    """Cache a successful payload for `city`."""
+    if len(_weather_cache) > 200:  # hygiene: never grow without bound
+        _weather_cache.clear()
+    _weather_cache[city.lower()] = (time.time() + CACHE_TTL, payload)
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -292,6 +315,10 @@ def api_weather():
 
     if not city:
         return jsonify({"error": "empty_city"}), 400
+
+    cached = cache_get(city)
+    if cached is not None:
+        return jsonify(cached)
 
     try:
         location = geocode_city(city)
@@ -314,20 +341,20 @@ def api_weather():
         except WeatherAPIError:
             return jsonify({"error": "service_unavailable"}), 502
 
-    return jsonify(
-        {
-            "city": location["city"],
-            "country": location["country"],
-            "timezone": location["timezone"],
-            "source": source,
-            "temperature": weather["temperature"],
-            "feels_like": weather["feels_like"],
-            "humidity": weather["humidity"],
-            "wind_speed": weather["wind_speed"],
-            "condition": weather["condition"],
-            "is_day": weather["is_day"],
-        }
-    )
+    payload = {
+        "city": location["city"],
+        "country": location["country"],
+        "timezone": location["timezone"],
+        "source": source,
+        "temperature": weather["temperature"],
+        "feels_like": weather["feels_like"],
+        "humidity": weather["humidity"],
+        "wind_speed": weather["wind_speed"],
+        "condition": weather["condition"],
+        "is_day": weather["is_day"],
+    }
+    cache_put(city, payload)
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
