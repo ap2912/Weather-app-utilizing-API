@@ -9,6 +9,9 @@ contract, and returns it to the frontend.
 No raw API responses are exposed. No API key is needed.
 """
 
+import logging
+import time
+
 import requests
 from flask import Flask, jsonify, render_template, request
 
@@ -17,7 +20,16 @@ app = Flask(__name__)
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 15  # seconds per attempt
+MAX_ATTEMPTS = 3      # total tries before giving up
+RETRY_DELAY = 2       # seconds to wait between attempts
+
+# A descriptive User-Agent: some networks/WAFs treat the default
+# python-requests UA worse than an identified client.
+HEADERS = {"User-Agent": "WeatherNow/1.0 (educational project)"}
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("weather-now")
 
 # WMO weather interpretation codes, as documented by Open-Meteo.
 WEATHER_CODES = {
@@ -69,18 +81,39 @@ def fetch_json(url, params):
     """GET `url` with query params, return parsed JSON.
 
     Always sends params via `requests` (never hand-built URLs),
-    enforces a timeout, and raises WeatherAPIError on any failure.
+    enforces a timeout, retries transient failures, logs the real
+    reason server-side, and raises WeatherAPIError if all attempts fail.
     """
-    try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise WeatherAPIError(f"Upstream request failed: {exc}") from exc
+    last_exc = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url, params=params, timeout=REQUEST_TIMEOUT, headers=HEADERS
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            status = (
+                exc.response.status_code
+                if getattr(exc, "response", None) is not None
+                else "no-response"
+            )
+            logger.warning(
+                "Upstream request failed (attempt %d/%d, status=%s): %s -- %s",
+                attempt, MAX_ATTEMPTS, status, url, exc,
+            )
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+            continue
 
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise WeatherAPIError("Upstream service returned invalid JSON.") from exc
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise WeatherAPIError("Upstream service returned invalid JSON.") from exc
+
+    raise WeatherAPIError(
+        f"Upstream request failed after {MAX_ATTEMPTS} attempts: {last_exc}"
+    ) from last_exc
 
 
 def geocode_city(city):
