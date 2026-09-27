@@ -28,6 +28,11 @@ RETRY_DELAY = 2       # seconds to wait between attempts
 # python-requests UA worse than an identified client.
 HEADERS = {"User-Agent": "WeatherNow/1.0 (educational project)"}
 
+# Fallback forecast provider: the Norwegian Meteorological Institute.
+# Free, no API key needed, but it requires an identifying User-Agent.
+METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+METNO_HEADERS = {"User-Agent": "WeatherNow/1.0 (educational project)"}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("weather-now")
 
@@ -77,18 +82,24 @@ def get_weather_condition(code):
     return WEATHER_CODES.get(code, "Unknown conditions")
 
 
-def fetch_json(url, params):
+def fetch_json(url, params, headers=None):
     """GET `url` with query params, return parsed JSON.
 
     Always sends params via `requests` (never hand-built URLs),
     enforces a timeout, retries transient failures, logs the real
     reason server-side, and raises WeatherAPIError if all attempts fail.
+
+    A 429 (rate limit) is never retried: hammering a capped endpoint
+    cannot succeed, so we fail fast and let the caller fall back.
     """
     last_exc = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = requests.get(
-                url, params=params, timeout=REQUEST_TIMEOUT, headers=HEADERS
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+                headers=headers or HEADERS,
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as exc:
@@ -102,8 +113,9 @@ def fetch_json(url, params):
                 "Upstream request failed (attempt %d/%d, status=%s): %s -- %s",
                 attempt, MAX_ATTEMPTS, status, url, exc,
             )
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
+            if status == 429 or attempt >= MAX_ATTEMPTS:
+                break
+            time.sleep(RETRY_DELAY)
             continue
 
         try:
@@ -112,7 +124,7 @@ def fetch_json(url, params):
             raise WeatherAPIError("Upstream service returned invalid JSON.") from exc
 
     raise WeatherAPIError(
-        f"Upstream request failed after {MAX_ATTEMPTS} attempts: {last_exc}"
+        f"Upstream request failed after {attempt} attempt(s): {last_exc}"
     ) from last_exc
 
 
@@ -137,8 +149,8 @@ def geocode_city(city):
     }
 
 
-def fetch_weather(latitude, longitude):
-    """Fetch current weather for coordinates and normalize the data."""
+def fetch_open_meteo(latitude, longitude):
+    """Primary forecast via Open-Meteo. Returns the normalized weather dict."""
     payload = fetch_json(
         FORECAST_URL,
         {
@@ -173,6 +185,102 @@ def fetch_weather(latitude, longitude):
         raise WeatherAPIError(f"Weather data is missing a field: {exc}") from exc
 
 
+def apparent_temperature(temp_c, humidity, wind_kmh):
+    """Rough 'feels like': wind chill when cold, heat index when hot."""
+    if temp_c <= 10 and wind_kmh > 4.8:
+        v = wind_kmh ** 0.16  # wind chill formula (Environment Canada)
+        return 13.12 + 0.6215 * temp_c - 11.37 * v + 0.3965 * temp_c * v
+    if temp_c >= 27:  # Rothfusz heat-index regression
+        t_f = temp_c * 9 / 5 + 32
+        hi_f = (
+            -42.379
+            + 2.04901523 * t_f
+            + 10.14333127 * humidity
+            - 0.22475541 * t_f * humidity
+            - 0.00683783 * t_f * t_f
+            - 0.05481717 * humidity * humidity
+            + 0.00122874 * t_f * t_f * humidity
+            + 0.00085282 * t_f * humidity * humidity
+            - 0.00000199 * t_f * t_f * humidity * humidity
+        )
+        return (hi_f - 32) * 5 / 9
+    return temp_c
+
+
+def metno_condition(symbol_code):
+    """Convert a met.no symbol_code (e.g. 'partlycloudy_day') to readable text."""
+    if not symbol_code:
+        return "Unknown"
+    base = symbol_code.replace("_day", "").replace("_night", "")
+    names = {
+        "clearsky": "Clear sky",
+        "fair": "Fair",
+        "partlycloudy": "Partly cloudy",
+        "cloudy": "Cloudy",
+        "lightrainshowers": "Light rain showers",
+        "rainshowers": "Rain showers",
+        "heavyrainshowers": "Heavy rain showers",
+        "lightrain": "Light rain",
+        "rain": "Rain",
+        "heavyrain": "Heavy rain",
+        "lightsnowshowers": "Light snow showers",
+        "snowshowers": "Snow showers",
+        "heavysnowshowers": "Heavy snow showers",
+        "lightsnow": "Light snow",
+        "snow": "Snow",
+        "heavysnow": "Heavy snow",
+        "lightsleetshowers": "Light sleet showers",
+        "sleetshowers": "Sleet showers",
+        "heavysleetshowers": "Heavy sleet showers",
+        "lightsleet": "Light sleet",
+        "sleet": "Sleet",
+        "heavysleet": "Heavy sleet",
+        "fog": "Fog",
+    }
+    if base in names:
+        return names[base]
+    if "thunder" in base:
+        return "Thunderstorm"
+    return base.replace("_", " ").strip().title() or "Unknown"
+
+
+def fetch_metno(latitude, longitude):
+    """Fallback forecast via met.no (no API key). Returns normalized weather dict."""
+    payload = fetch_json(
+        METNO_URL,
+        {"lat": latitude, "lon": longitude},
+        headers=METNO_HEADERS,
+    )
+
+    try:
+        now = payload["properties"]["timeseries"][0]
+        details = now["data"]["instant"]["details"]
+        symbol = None
+        for key in ("next_1_hours", "next_6_hours"):
+            block = now["data"].get(key) or {}
+            symbol = (block.get("summary") or {}).get("symbol_code")
+            if symbol:
+                break
+    except (KeyError, IndexError, TypeError) as exc:
+        raise WeatherAPIError("Fallback service returned unexpected data.") from exc
+
+    temperature = details.get("air_temperature")
+    if temperature is None:
+        raise WeatherAPIError("Fallback service returned unexpected data.")
+    humidity = details.get("relative_humidity") or 0
+    wind_ms = details.get("wind_speed") or 0
+    wind_kmh = wind_ms * 3.6  # met.no uses m/s; our contract uses km/h
+
+    return {
+        "temperature": round(temperature),
+        "feels_like": round(apparent_temperature(temperature, humidity, wind_kmh)),
+        "humidity": round(humidity),
+        "wind_speed": round(wind_kmh),
+        "condition": metno_condition(symbol),
+        "is_day": not (symbol or "").endswith("_night"),
+    }
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -187,18 +295,31 @@ def api_weather():
 
     try:
         location = geocode_city(city)
-        weather = fetch_weather(location["latitude"], location["longitude"])
     except CityNotFoundError:
         return jsonify({"error": "city_not_found"}), 404
     except WeatherAPIError:
         # Never leak tracebacks or upstream details to the browser.
         return jsonify({"error": "service_unavailable"}), 502
 
+    # Primary provider first; if it is rate-limited or down, degrade
+    # gracefully to the fallback instead of failing the request.
+    try:
+        weather = fetch_open_meteo(location["latitude"], location["longitude"])
+        source = "open-meteo"
+    except WeatherAPIError as exc:
+        logger.warning("Primary forecast failed (%s); trying met.no fallback.", exc)
+        try:
+            weather = fetch_metno(location["latitude"], location["longitude"])
+            source = "met.no"
+        except WeatherAPIError:
+            return jsonify({"error": "service_unavailable"}), 502
+
     return jsonify(
         {
             "city": location["city"],
             "country": location["country"],
             "timezone": location["timezone"],
+            "source": source,
             "temperature": weather["temperature"],
             "feels_like": weather["feels_like"],
             "humidity": weather["humidity"],
